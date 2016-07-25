@@ -157,6 +157,47 @@ module Mongoid #:nodoc
           connection.send(method, *arguments, &block)
         end
       end
+
+      def copy(destination, sources, options = {})
+        copied = []
+
+        FileUtils.mkdir_p(destination) unless File.exist?(destination)
+        destination_migrations = Mongoid::Migrator.migrations(destination)
+
+        sources.each do |scope, path|
+          source_migrations = Mongoid::Migrator.migrations(path)
+
+          source_migrations.each do |migration|
+            source = File.binread(migration.filename)
+            inserted_comment = "# This migration comes from #{scope} (originally #{migration.version})\n"
+            if /\A#.*\b(?:en)?coding:\s*\S+/ =~ source
+              # If we have a magic comment in the original migration,
+              # insert our comment after the first newline(end of the magic comment line)
+              # so the magic keep working.
+              # Note that magic comments must be at the first line(except sh-bang).
+              source[/\n/] = "\n#{inserted_comment}"
+            else
+              source = "#{inserted_comment}#{source}"
+            end
+
+            if duplicate = destination_migrations.detect { |m| m.name == migration.name }
+              if options[:on_skip] && duplicate.scope != scope.to_s
+                options[:on_skip].call(scope, migration)
+              end
+              next
+            end
+
+            migration.version = Mongoid::Generators::Base.next_migration_number(destination).to_i
+            new_path = File.join(destination, "#{migration.version}_#{migration.name.underscore}.#{scope}.rb")
+            old_path, migration.filename = migration.filename, new_path
+
+            File.binwrite(migration.filename, source)
+            copied << migration
+            options[:on_copy].call(scope, migration, old_path) if options[:on_copy]
+            destination_migrations << migration
+          end
+        end
+      end
     end
   end
 
@@ -240,6 +281,33 @@ module Mongoid #:nodoc
         # Use the Active Record objects own table_name, or pre/suffix from ActiveRecord::Base if name is a symbol/string
         # name.table_name rescue "#{ActiveRecord::Base.table_name_prefix}#{name}#{ActiveRecord::Base.table_name_suffix}"
         name
+      end
+
+      def migrations(path)
+        files = Dir["#{path}/[0-9]*_*.rb"]
+
+        migrations = files.inject([]) do |klasses, file|
+          version, name = file.scan(/([0-9]+)_([_a-z0-9]*).rb/).first
+
+          raise IllegalMigrationNameError.new(file) unless version
+          version = version.to_i
+
+          if klasses.detect { |m| m.version == version }
+            raise DuplicateMigrationVersionError.new(version)
+          end
+
+          if klasses.detect { |m| m.name == name.camelize }
+            raise DuplicateMigrationNameError.new(name.camelize)
+          end
+
+          migration = MigrationProxy.new
+          migration.name     = name.camelize
+          migration.version  = version
+          migration.filename = file
+          klasses << migration
+        end
+
+        migrations.sort_by(&:version)
       end
 
       private
@@ -326,30 +394,7 @@ module Mongoid #:nodoc
 
     def migrations
       @migrations ||= begin
-        files = Dir["#{@migrations_path}/[0-9]*_*.rb"]
-
-        migrations = files.inject([]) do |klasses, file|
-          version, name = file.scan(/([0-9]+)_([_a-z0-9]*).rb/).first
-
-          raise IllegalMigrationNameError.new(file) unless version
-          version = version.to_i
-
-          if klasses.detect { |m| m.version == version }
-            raise DuplicateMigrationVersionError.new(version)
-          end
-
-          if klasses.detect { |m| m.name == name.camelize }
-            raise DuplicateMigrationNameError.new(name.camelize)
-          end
-
-          migration = MigrationProxy.new
-          migration.name     = name.camelize
-          migration.version  = version
-          migration.filename = file
-          klasses << migration
-        end
-
-        migrations = migrations.sort_by(&:version)
+        migrations = Migrator.migrations(@migrations_path)
         down? ? migrations.reverse : migrations
       end
     end
